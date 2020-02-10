@@ -420,6 +420,7 @@ lazy val `scio-core`: Project = project
       "io.grpc" % "grpc-core" % grpcVersion,
       "io.grpc" % "grpc-auth" % grpcVersion,
       "io.grpc" % "grpc-netty" % grpcVersion,
+      "com.spotify" %% "magnolify-guava" % magnolifyVersion,
       "com.github.alexarchambault" %% "case-app" % caseappVersion,
       "com.github.ben-manes.caffeine" % "caffeine" % caffeineVersion % "provided",
       "joda-time" % "joda-time" % jodaTimeVersion,
@@ -473,6 +474,7 @@ lazy val `scio-test`: Project = project
       "org.scalatestplus" %% "scalatestplus-scalacheck" % scalatestplusVersion % "test,it",
       "org.scalacheck" %% "scalacheck" % scalacheckVersion % "test,it",
       "com.spotify" %% "magnolify-datastore" % magnolifyVersion % "it",
+      "com.spotify" %% "magnolify-guava" % magnolifyVersion % "test",
       // DataFlow testing requires junit and hamcrest
       "org.hamcrest" % "hamcrest-core" % hamcrestVersion,
       "org.hamcrest" % "hamcrest-library" % hamcrestVersion,
