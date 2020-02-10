@@ -20,84 +20,19 @@ package com.spotify.scio.values
 import java.lang.{Iterable => JIterable}
 import java.util.{Map => JMap}
 
+import com.google.common.hash.Funnel
 import com.spotify.scio.ScioContext
 import com.spotify.scio.coders.{Coder, CoderMaterializer}
+import com.spotify.scio.hash._
 import com.spotify.scio.util._
 import com.spotify.scio.util.random.{BernoulliValueSampler, PoissonValueSampler}
-import com.twitter.algebird.{Aggregator, Hash128, Monoid, Semigroup}
+import com.twitter.algebird.{Aggregator, Monoid, Semigroup}
 import org.apache.beam.sdk.transforms._
 import org.apache.beam.sdk.values.{KV, PCollection, PCollectionView}
 import org.slf4j.LoggerFactory
 
 private object PairSCollectionFunctions {
   private val logger = LoggerFactory.getLogger(this.getClass)
-
-  final case class BFSettings(width: Int, capacity: Int, numBFs: Int)
-
-  /*
-   * This function calculates the width and number of bloom filters that would be optimally
-   * required to maintain the given fpProb.
-   *
-   * For sparse transforms, BloomFilters are stored as SideInputs.
-   * For some runners, this side input size might exceed the cache in the worker.
-   * We log an info or a warning (size > 100MB) for the user to take appropriate action.
-   * The side input cache limit for Dataflow Runner is 100 MB and for Spark runner is 10MB.
-   *
-   * This function is only called from `optimalKeysBloomFiltersAsSideInputs` which is used only
-   * by sparse transforms as of now.
-   *
-   * https://github.com/spotify/scio/issues/2040
-   */
-  def optimalBFSettings(tfName: String, numEntries: Long, fpProb: Double): BFSettings = {
-    // double to int rounding error happens when numEntries > (1 << 27)
-    // set numEntries upper bound to 1 << 27 to avoid high false positive
-    def estimateWidth(numEntries: Int, fpProb: Double): Int =
-      math
-        .ceil(-1 * numEntries * math.log(fpProb) / math.log(2) / math.log(2))
-        .toInt
-
-    // upper bound of n as 2^x
-    def upper(n: Int): Int = 1 << (0 to 27).find(1 << _ >= n).get
-
-    // cap capacity between [minSize, maxSize] and find upper bound of 2^x
-    val (minSize, maxSize) = (2048, 1 << 27)
-    var capacity = upper(math.max(math.min(numEntries, maxSize).toInt, minSize))
-
-    // find a width with the given capacity
-    var width = estimateWidth(capacity, fpProb)
-    while (width == Int.MaxValue) {
-      capacity = capacity >> 1
-      width = estimateWidth(capacity, fpProb)
-    }
-    val numBFs = (numEntries / capacity).toInt + 1
-
-    val totalBytes = width.toLong * numBFs / 8
-    val totalSizeMb = totalBytes / 1024.0 / 1024.0
-
-    val sideInputLogMessage = s"""
-     |Estimated size of BloomFilter(s) for $numEntries elements with false positive probability of
-     |$fpProb in step $tfName is $totalSizeMb MB.
-     |
-     |Optimal Width of each BloomFilter: $width bits.
-     |Capacity of each BloomFilter: $capacity elements.
-     |Number of BFs: $numBFs
-    """.stripMargin
-
-    val sideInputWarnMessage = s"""
-     |This might exceed worker caches in some runners.
-     |
-     |Please set runner specific worker memory cache above $totalSizeMb.
-     |More info: https://spotify.github.io/scio/FAQ.html#how-do-i-improve-side-input-performance-
-    """.stripMargin
-
-    if (totalSizeMb > 100) {
-      logger.warn(sideInputLogMessage + sideInputWarnMessage)
-    } else {
-      logger.debug(sideInputLogMessage)
-    }
-
-    BFSettings(width, capacity, numBFs)
-  }
 }
 
 /**
@@ -325,7 +260,7 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
     rhsNumKeys: Long,
     fpProb: Double = 0.01
   )(
-    implicit hash: Hash128[K],
+    implicit funnel: Funnel[K],
     koder: Coder[K],
     voder: Coder[V]
   ): SCollection[(K, (Option[V], Option[W]))] = self.transform { me =>
@@ -363,7 +298,7 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
     rhsNumKeys: Long,
     fpProb: Double = 0.01
   )(
-    implicit hash: Hash128[K],
+    implicit funnel: Funnel[K],
     koder: Coder[K],
     voder: Coder[V]
   ): SCollection[(K, (Option[V], Option[W]))] =
@@ -392,7 +327,7 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
     rhs: SCollection[(K, W)],
     rhsNumKeys: Long,
     fpProb: Double = 0.01
-  )(implicit hash: Hash128[K], koder: Coder[K], voder: Coder[V]): SCollection[(K, (V, W))] =
+  )(implicit funnel: Funnel[K], koder: Coder[K], voder: Coder[V]): SCollection[(K, (V, W))] =
     self.transform { me =>
       SCollection.unionAll(
         split(me, rhs, rhsNumKeys, fpProb).map {
@@ -425,7 +360,11 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
     rhs: SCollection[(K, W)],
     rhsNumKeys: Long,
     fpProb: Double = 0.01
-  )(implicit hash: Hash128[K], koder: Coder[K], voder: Coder[V]): SCollection[(K, (V, Option[W]))] =
+  )(
+    implicit funnel: Funnel[K],
+    koder: Coder[K],
+    voder: Coder[V]
+  ): SCollection[(K, (V, Option[W]))] =
     self.transform { me =>
       SCollection.unionAll(
         split(me, rhs, rhsNumKeys, fpProb).map {
@@ -459,7 +398,11 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
     rhs: SCollection[(K, W)],
     rhsNumKeys: Long,
     fpProb: Double = 0.01
-  )(implicit hash: Hash128[K], koder: Coder[K], voder: Coder[V]): SCollection[(K, (Option[V], W))] =
+  )(
+    implicit funnel: Funnel[K],
+    koder: Coder[K],
+    voder: Coder[V]
+  ): SCollection[(K, (Option[V], W))] =
     self.transform { me =>
       SCollection.unionAll(
         split(me, rhs, rhsNumKeys, fpProb).map {
@@ -485,7 +428,7 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
     rhsNumKeys: Long,
     fpProb: Double
   )(
-    implicit hash: Hash128[K],
+    implicit funnel: Funnel[K],
     koder: Coder[K],
     voder: Coder[V]
   ): Seq[(SCollection[(K, V)], SCollection[(K, V)], SCollection[(K, W)])] = {
@@ -501,7 +444,7 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
         val partitionedLhs = lhs
           .withSideInputs(bfsi)
           .transformWithSideOutputs(Seq(lhsUnique, lhsOverlap)) { (e, c) =>
-            if (c(bfsi).maybeContains(e._1)) {
+            if (c(bfsi).mightContain(e._1)) {
               lhsOverlap
             } else {
               lhsUnique
@@ -526,7 +469,7 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
    *               probability when discarding elements of `rhs` in the pre-filter step.
    */
   def sparseLookup[A: Coder](rhs: SCollection[(K, A)], thisNumKeys: Long, fpProb: Double)(
-    implicit hash: Hash128[K],
+    implicit funnel: Funnel[K],
     koder: Coder[K],
     voder: Coder[V]
   ): SCollection[(K, (V, Iterable[A]))] = self.transform { sColl =>
@@ -547,7 +490,7 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
                 rhs1
                   .withSideInputs(lhsBfSi)
                   .filter { (e, c) =>
-                    c(lhsBfSi).maybeContains(e._1)
+                    c(lhsBfSi).mightContain(e._1)
                   }
                   .toSCollection
               )
@@ -569,7 +512,7 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
    *                    in intermediate steps which means less shuffle.
    */
   def sparseLookup[A: Coder](rhs: SCollection[(K, A)], thisNumKeys: Long)(
-    implicit hash: Hash128[K],
+    implicit funnel: Funnel[K],
     koder: Coder[K],
     voder: Coder[V]
   ): SCollection[(K, (V, Iterable[A]))] = sparseLookup(rhs, thisNumKeys, 0.01)
@@ -595,7 +538,7 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
     thisNumKeys: Long,
     fpProb: Double
   )(
-    implicit hash: Hash128[K],
+    implicit funnel: Funnel[K],
     koder: Coder[K],
     voder: Coder[V]
   ): SCollection[(K, (V, Iterable[A], Iterable[B]))] = self.transform { sColl =>
@@ -614,13 +557,13 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
               rhs1
                 .withSideInputs(lhsBfSi)
                 .filter { (e, c) =>
-                  c(lhsBfSi).maybeContains(e._1)
+                  c(lhsBfSi).mightContain(e._1)
                 }
                 .toSCollection,
               rhs2
                 .withSideInputs(lhsBfSi)
                 .filter { (e, c) =>
-                  c(lhsBfSi).maybeContains(e._1)
+                  c(lhsBfSi).mightContain(e._1)
                 }
                 .toSCollection
             )
@@ -646,7 +589,7 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
     rhs2: SCollection[(K, B)],
     thisNumKeys: Long
   )(
-    implicit hash: Hash128[K],
+    implicit funnel: Funnel[K],
     koder: Coder[K],
     voder: Coder[V]
   ): SCollection[(K, (V, Iterable[A], Iterable[B]))] =
@@ -654,22 +597,29 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
 
   private[values] def optimalKeysBloomFiltersAsSideInputs(
     thisNumKeys: Long,
-    fpProb: Double
-  )(implicit hash: Hash128[K], koder: Coder[K], voder: Coder[V]): Seq[SideInput[MutableBF[K]]] = {
-    val bfSettings = PairSCollectionFunctions.optimalBFSettings(self.tfName, thisNumKeys, fpProb)
+    fpp: Double
+  )(implicit funnel: Funnel[K], koder: Coder[K], voder: Coder[V]): Seq[SideInput[BloomFilter[K]]] =
+    if (self.context.isTest) {
+      // use exact element count to avoid OOM from very large `thisNumKeys`
+      val side = self.keys
+        .asApproxFilter(BloomFilter, 0, fpp)
+        .asSingletonSideInput(BloomFilter.create(Nil, 1, fpp))
+      Seq(side)
+    } else {
+      val settings = BloomFilter.partitionSettings(thisNumKeys, fpp, 100 * 1024 * 1024)
+      PairSCollectionFunctions.logger.info(
+        "Partition settings for Bloom filter side input of {} keys: " +
+          "partitions={}, expectedInsertions={}, sizeBytes={}",
+        Seq(thisNumKeys, settings.partitions, settings.expectedInsertions, settings.sizeBytes)
+      )
 
-    val numKeysPerPartition = if (bfSettings.numBFs == 1) thisNumKeys.toInt else bfSettings.capacity
-    val n = bfSettings.numBFs
-    val width = BloomFilter.optimalWidth(numKeysPerPartition, fpProb).get
-    val numHashes = BloomFilter.optimalNumHashes(numKeysPerPartition, width)
-    val bfAggregator = BloomFilterAggregator[K](numHashes, width)
-    self.keys
-      .hashPartition(n)
-      .map { me =>
-        me.aggregate(bfAggregator.monoid.zero)(_ += _, _ ++= _)
-          .asSingletonSideInput(bfAggregator.monoid.zero)
-      }
-  }
+      self.keys
+        .hashPartition(settings.partitions)
+        .map { me =>
+          me.asApproxFilter(BloomFilter, settings.expectedInsertions, fpp)
+            .asSingletonSideInput(BloomFilter.create(Nil, settings.expectedInsertions, fpp))
+        }
+    }
 
   // =======================================================================
   // Transformations
@@ -922,7 +872,7 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
     rhsNumKeys: Long,
     computeExact: Boolean = false,
     fpProb: Double = 0.01
-  )(implicit koder: Coder[K], voder: Coder[V], hash: Hash128[K]): SCollection[(K, V)] =
+  )(implicit koder: Coder[K], voder: Coder[V], funnel: Funnel[K]): SCollection[(K, V)] =
     self.transform { me =>
       val rhsBfs = rhs.map(k => (k, ())).optimalKeysBloomFiltersAsSideInputs(rhsNumKeys, fpProb)
       val n = rhsBfs.size
@@ -936,7 +886,7 @@ class PairSCollectionFunctions[K, V](val self: SCollection[(K, V)]) {
             case ((lhs, rhs), rhsBf) =>
               val approxResults = lhs
                 .withSideInputs(rhsBf)
-                .filter { case (e, c) => c(rhsBf).maybeContains(e._1) }
+                .filter { case (e, c) => c(rhsBf).mightContain(e._1) }
                 .toSCollection
 
               if (computeExact) {
